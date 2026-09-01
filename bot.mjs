@@ -1,6 +1,6 @@
 /**
  * ═══════════════════════════════════════════════════════════════════════════
- *  Audius Feed Bot — Account 2 Engine (Multi-Notifier System)
+ *  Audius Feed Bot — Account 2 Engine (Multi-Notifier System - Auto Clean)
  * ═══════════════════════════════════════════════════════════════════════════
  */
 
@@ -11,17 +11,16 @@ import http from 'http';
 import { sdk } from '@audius/sdk';
 import { Wallet } from 'ethers';
 
-// ─── Unhandled Exception Safety Net ─────────────────────────────────────────
+// ─── Crash Prevention Safety Nets ──────────────────────────────────────────
 process.on('uncaughtException', (err) => {
   console.error('⚠️ Uncaught Exception:', err.message);
 });
 
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('⚠️ Unhandled Rejection at:', promise, 'reason:', reason);
+process.on('unhandledRejection', (reason) => {
+  console.error('⚠️ Unhandled Rejection:', reason?.message || reason);
 });
 
 let isStartupNotificationSent = false;
-let isInitialRun = true;
 let activeDiscoveryNode = 'https://discoveryprovider.audius.co';
 let audiusSdk = null;
 
@@ -32,11 +31,8 @@ const pendingSkips = new Set(); // Stores tracks flagged for skip by user
 // ─── Render RAM Protection System ──────────────────────────────────────────
 setInterval(() => {
   const memory = process.memoryUsage();
-  const heapUsedMb = (memory.heapUsed / 1024 / 1024).toFixed(2);
-  const rssMb = (memory.rss / 1024 / 1024).toFixed(2);
-
-  if (global.gc && memory.heapUsed > 300 * 1024 * 1024) {
-    console.log(`[RAM] 🧹 Triggering GC. Heap: ${heapUsedMb}MB | RSS: ${rssMb}MB`);
+  if (global.gc && memory.heapUsed > 250 * 1024 * 1024) {
+    console.log(`[RAM] 🧹 Triggering GC. Heap: ${(memory.heapUsed / 1024 / 1024).toFixed(2)}MB`);
     global.gc();
   }
 }, 30_000);
@@ -56,16 +52,16 @@ const __dirname  = path.dirname(__filename);
 // ─── Configuration ────────────────────────────────────────────────────────
 const CONFIG = Object.freeze({
   // Primary Bot (Main Controller & Executor — Phone 1)
-  TELEGRAM_BOT_TOKEN: '8706784155:AAGj2Q8RU6DFU4MJk4oiFgfDuvxpiMasJ7s',
-  TELEGRAM_CHAT_ID:   '5876482404',
+  TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '8706784155:AAGj2Q8RU6DFU4MJk4oiFgfDuvxpiMasJ7s',
+  TELEGRAM_CHAT_ID:   process.env.TELEGRAM_CHAT_ID || '5876482404',
 
   // Secondary Bot (Notifier 1 — Phone 2)
-  NOTIFIER_BOT_TOKEN: '7640572608:AAF9Q3ufDvqshy3RtJ1CkLAdVu5jcNeYCNk',
-  NOTIFIER_CHAT_ID:   '7776788573',
+  NOTIFIER_BOT_TOKEN: process.env.NOTIFIER_BOT_TOKEN || '7640572608:AAF9Q3ufDvqshy3RtJ1CkLAdVu5jcNeYCNk',
+  NOTIFIER_CHAT_ID:   process.env.NOTIFIER_CHAT_ID || '7776788573',
 
   // Tertiary Bot (Notifier 2 — Phone 3)
-  NOTIFIER2_BOT_TOKEN: '8887527764:AAH1kfUDzl6mB2sNVKrNq-dz8_0A5eOx8Jg',
-  NOTIFIER2_CHAT_ID:   '7086442015',
+  NOTIFIER2_BOT_TOKEN: process.env.NOTIFIER2_BOT_TOKEN || '8887527764:AAH1kfUDzl6mB2sNVKrNq-dz8_0A5eOx8Jg',
+  NOTIFIER2_CHAT_ID:   process.env.NOTIFIER2_CHAT_ID || '7086442015',
 
   AUDIUS_USER_ID:     process.env.AUDIUS_USER_ID || 'ygvzYM4',
   APP_NAME:           process.env.AUDIUS_APP_NAME || 'audius-client',
@@ -81,6 +77,10 @@ const CONFIG = Object.freeze({
 
   MAX_LIKES_THRESHOLD: 10,
   MAX_REPOSTS_THRESHOLD: 10,
+  MAX_DURATION_SEC: 300,       // 5 Minutes Max Track Duration
+
+  LIKE_PROBABILITY: 0.80,      // 80% Chance to Like
+  REPOST_PROBABILITY: 1.00     // 100% Chance to Repost
 });
 
 let isBotActive = true;
@@ -113,7 +113,6 @@ const log = {
   ok:   (msg) => console.log(`  [${new Date().toLocaleTimeString()}]  ✅  ${msg}`),
   warn: (msg) => console.log(`  [${new Date().toLocaleTimeString()}]  ⚠️  ${msg}`),
   error:(msg) => console.error(`  [${new Date().toLocaleTimeString()}]  ❌  ${msg}`),
-  debug:(msg) => console.log(`  [${new Date().toLocaleTimeString()}]  🔍  ${msg}`),
 };
 
 // ─── Audius SDK Initialization ─────────────────────────────────────────────
@@ -134,16 +133,10 @@ function getAudiusSDK() {
 async function sendAudiusSignedAction(trackId, actionType) {
   try {
     const privateKey = process.env.AUDIUS_PRIVATE_KEY;
-    if (!privateKey) {
-      log.error(`Missing AUDIUS_PRIVATE_KEY environment variable!`);
-      return false;
-    }
+    if (!privateKey) return false;
 
     const cleanHex = String(privateKey).replace(/^0x/, '').trim();
-    if (cleanHex.length !== 64) {
-      log.error(`Invalid AUDIUS_PRIVATE_KEY length (${cleanHex.length} chars). Expected 64 hex characters.`);
-      return false;
-    }
+    if (cleanHex.length !== 64) return false;
 
     const wallet = new Wallet(`0x${cleanHex}`);
     const timestamp = Math.floor(Date.now() / 1000);
@@ -234,25 +227,11 @@ async function apiUnrepostTrack(trackId) {
 
   try {
     const audius = getAudiusSDK();
-    if (typeof audius.tracks.unrepostTrack === 'function') {
-      await audius.tracks.unrepostTrack({
-        trackId: trackId,
-        userId: CONFIG.AUDIUS_USER_ID,
-      });
-      return true;
-    } else if (typeof audius.tracks.undorepostTrack === 'function') {
-      await audius.tracks.undorepostTrack({
-        trackId: trackId,
-        userId: CONFIG.AUDIUS_USER_ID,
-      });
-      return true;
-    } else {
-      const res = await fetch(`${activeDiscoveryNode}/v1/tracks/${trackId}/repost?app_name=${CONFIG.APP_NAME}`, {
-        method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' }
-      });
-      return res.ok;
-    }
+    await audius.tracks.undorepostTrack({
+      trackId: trackId,
+      userId: CONFIG.AUDIUS_USER_ID,
+    });
+    return true;
   } catch (err) {
     log.error(`SDK Unrepost Error on track ${trackId}: ${err.message}`);
     return false;
@@ -295,7 +274,7 @@ async function sendNotifierAlert(token, chatId, htmlText) {
       }),
     });
   } catch (err) {
-    console.error(`Telegram Notifier Error (${chatId}): ${err.message}`);
+    log.warn(`Telegram Notifier Error (${chatId}): ${err.message}`);
   }
 }
 
@@ -327,7 +306,6 @@ async function cleanUpOldTelegramMessages() {
       await deleteTelegramMessage(msgId);
       await sleep(150);
     }
-    log.info(`🧹 Auto-cleaned ${messagesToDelete.length} old Telegram messages.`);
   }
 }
 
@@ -358,24 +336,26 @@ async function sendTelegramAlert(htmlText, includeMenu = false, inlineKeyboard =
     };
   }
 
-  try {
-    const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-    const data = await res.json();
-    if (data.ok && data.result?.message_id) {
-      const newMsgId = data.result.message_id;
-      sentTelegramMessageIds.push(newMsgId);
-      await cleanUpOldTelegramMessages();
-      return newMsgId;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (data.ok && data.result?.message_id) {
+        const newMsgId = data.result.message_id;
+        sentTelegramMessageIds.push(newMsgId);
+        await cleanUpOldTelegramMessages();
+        return newMsgId;
+      }
+      break;
+    } catch (err) {
+      if (attempt < 3) await sleep(2000);
     }
-    return null;
-  } catch (err) {
-    console.error(`Telegram Send Error: ${err.message}`);
-    return null;
   }
+  return null;
 }
 
 async function editTelegramMessage(messageId, htmlText, inlineKeyboard = null) {
@@ -424,7 +404,7 @@ async function pollTelegramUpdates(processedSet) {
   if (!token || !targetChatId) return;
 
   try {
-    const res = await fetch(`https://api.telegram.org/bot${token}/getUpdates?offset=${lastUpdateId + 1}&timeout=2`);
+    const res = await fetch(`https://api.telegram.org/bot${token}/getUpdates?offset=${lastUpdateId + 1}&timeout=5`);
     if (!res.ok) return;
 
     const data = await res.json();
@@ -433,7 +413,6 @@ async function pollTelegramUpdates(processedSet) {
     for (const update of data.result) {
       lastUpdateId = Math.max(lastUpdateId, update.update_id);
 
-      // Handle Callback Buttons (Skip & Permanent Undo)
       if (update.callback_query) {
         const query = update.callback_query;
         const dataStr = query.data;
@@ -442,13 +421,10 @@ async function pollTelegramUpdates(processedSet) {
           const trackIdToSkip = dataStr.replace('skip:', '');
           pendingSkips.add(trackIdToSkip);
           await answerCallbackQuery(query.id, '⏭️ Track skip requested!');
-          log.info(`⏭️ Skip button clicked for track ID: ${trackIdToSkip}`);
         } else if (dataStr && dataStr.startsWith('undo:')) {
           const trackIdToUndo = dataStr.replace('undo:', '');
-          await answerCallbackQuery(query.id, '⏳ Processing Undo (Unlike & Unrepost)...');
-          log.info(`↩️ Undo requested for track ID: ${trackIdToUndo}`);
+          await answerCallbackQuery(query.id, '⏳ Processing Undo...');
 
-          // Execute Unlike & Unrepost
           const [unliked, unreposted] = await Promise.all([
             apiUnlikeTrack(trackIdToUndo),
             apiUnrepostTrack(trackIdToUndo)
@@ -468,7 +444,6 @@ async function pollTelegramUpdates(processedSet) {
         continue;
       }
 
-      // Handle Text Commands
       const msg = update.message || update.edited_message;
       if (!msg || !msg.text || String(msg.chat?.id) !== targetChatId) continue;
 
@@ -497,24 +472,32 @@ async function pollTelegramUpdates(processedSet) {
           `📊 <b>Audius Bot 2 Status</b>\n\n` +
           `<b>State:</b> ${isBotActive ? '🟢 Active' : '🔴 Paused'}\n` +
           `<b>Discovery Node:</b> <code>${escapeHtml(activeDiscoveryNode)}</code>\n` +
-          `<b>Auto-Like:</b> ${actionToggles.likeEnabled ? '✅' : '❌'}\n` +
-          `<b>Auto-Repost:</b> ${actionToggles.repostEnabled ? '✅' : '❌'}\n\n` +
+          `<b>Auto-Like (80%):</b> ${actionToggles.likeEnabled ? '✅' : '❌'}\n` +
+          `<b>Auto-Repost (100%):</b> ${actionToggles.repostEnabled ? '✅' : '❌'}\n\n` +
           `🎵 <b>Latest Track in Feed:</b>\n• <i>${escapeHtml(latestSeenTrackName)}</i>\n\n` +
           `📈 <b>Stats:</b>\n• <b>Cached Tracks:</b> ${processedSet.size}\n• <b>System Uptime:</b> ${getUptime()}`;
         await sendTelegramAlert(msgStr, true);
       }
     }
-  } catch {}
+  } catch (err) {
+    await sleep(3000);
+  }
 }
 
 function startTelegramPoller(processedSet) {
-  setInterval(() => pollTelegramUpdates(processedSet), 2000);
+  const poll = async () => {
+    while (true) {
+      await pollTelegramUpdates(processedSet);
+      await sleep(1500);
+    }
+  };
+  poll();
 }
 
 // ─── Feed Extractor & Cache ────────────────────────────────────────────────
 
 async function fetchFeedAPI() {
-  const feedUrl = `${activeDiscoveryNode}/v1/users/${CONFIG.AUDIUS_USER_ID}/feed?limit=5&app_name=${CONFIG.APP_NAME}`;
+  const feedUrl = `${activeDiscoveryNode}/v1/users/${CONFIG.AUDIUS_USER_ID}/feed?limit=10&app_name=${CONFIG.APP_NAME}`;
   
   try {
     const res = await fetch(feedUrl, { headers: { 'Accept': 'application/json' } });
@@ -540,6 +523,7 @@ async function fetchFeedAPI() {
           permalink: trackObj.permalink || `/${trackObj.user?.handle || 'track'}/${trackObj.id || trackObj.track_id}`,
           favorite_count: trackObj.favorite_count || 0,
           repost_count: trackObj.repost_count || 0,
+          duration: trackObj.duration || 180,
           activity_timestamp: item.activity_timestamp || trackObj.created_at || 0,
         });
       }
@@ -550,16 +534,6 @@ async function fetchFeedAPI() {
     log.error(`API Fetch Exception: ${err.message}`);
     return [];
   }
-}
-
-function loadCache() {
-  try {
-    if (fs.existsSync(CONFIG.CACHE_FILE)) {
-      const data = JSON.parse(fs.readFileSync(CONFIG.CACHE_FILE, 'utf-8'));
-      if (Array.isArray(data.processedTrackIds)) return new Set(data.processedTrackIds);
-    }
-  } catch {}
-  return new Set();
 }
 
 function saveCache(processedSet) {
@@ -605,128 +579,135 @@ async function runLiveCountdownInTelegram(artistAndTitle, trackUrl, delaySeconds
 // ─── Main Execution Loop ───────────────────────────────────────────────────
 
 async function runFastLoop() {
-  const processedSet = loadCache();
-  
+  // Wipe cache and memory completely on startup to ensure instant scanning
+  const processedSet = new Set();
+  saveCache(processedSet);
+  log.ok('🧹 Cache wiped on startup. Bot 2 will immediately process current feed.');
+
   await selectDiscoveryNode();
   startTelegramPoller(processedSet);
 
   if (!isStartupNotificationSent) {
     isStartupNotificationSent = true;
-    await sendTelegramAlert('🚀 <b>Audius Feed Bot 2 Online</b> — Live with Skip, Permanent Undo & Dual Notifiers.', true);
-    await sendAllNotifiersAlert('🚀 <b>Feed Notifier Connected</b> — Ready to report new feed tracks.');
+    await sendTelegramAlert('🚀 <b>Audius Feed Bot 2 Online</b> — Cache cleared & crash protected.', true);
+    await sendAllNotifiersAlert('🚀 <b>Feed Notifiers Connected</b> — Ready to report new feed tracks.');
   }
 
   log.info(`Monitoring Account 2 feed every ${CONFIG.REFRESH_INTERVAL_MS / 1000}s…`);
 
   while (true) {
-    const tracks = await fetchFeedAPI();
+    try {
+      const tracks = await fetchFeedAPI();
 
-    if (tracks.length > 0) {
-      latestSeenTrackName = `${tracks[0].artist} - ${tracks[0].title}`;
-    }
+      if (tracks.length > 0) {
+        latestSeenTrackName = `${tracks[0].artist} - ${tracks[0].title}`;
+      }
 
-    if (isInitialRun) {
-      log.info('📌 Initializing baseline... Marking current feed tracks as seen.');
       for (const track of tracks) {
-        processedSet.add(track.permalink);
-      }
-      saveCache(processedSet);
-      isInitialRun = false;
-      await sleep(CONFIG.REFRESH_INTERVAL_MS);
-      continue;
-    }
+        const permalink = track.permalink;
+        const artistAndTitle = `${track.artist} - ${track.title}`;
+        const safeTitle = escapeHtml(track.title);
+        const safeArtist = escapeHtml(track.artist);
+        const trackUrl = `https://audius.co${permalink}`;
 
-    for (const track of tracks) {
-      const permalink = track.permalink;
-      const artistAndTitle = `${track.artist} - ${track.title}`;
-      const safeTitle = escapeHtml(track.title);
-      const safeArtist = escapeHtml(track.artist);
-      const trackUrl = `https://audius.co${permalink}`;
+        if (processedSet.has(permalink)) continue;
 
-      if (processedSet.has(permalink)) continue;
+        // Skip if track duration exceeds 5 minutes (300 seconds)
+        if (track.duration > CONFIG.MAX_DURATION_SEC) {
+          log.warn(`Duration limit exceeded (${track.duration}s > 300s) on "${artistAndTitle}". Skipping.`);
+          processedSet.add(permalink);
+          saveCache(processedSet);
+          continue;
+        }
 
-      // 1. Send Alert Card to BOTH Notifier Bots Simultaneously
-      const secondaryNotificationCard =
-        `🎵 <b>New Feed Track Detected!</b>\n\n` +
-        `<b>Song Title:</b> <a href="${trackUrl}">${safeTitle}</a>\n` +
-        `<b>Artist:</b> <code>${safeArtist}</code>\n\n` +
-        `📊 <b>Initial Stats:</b>\n` +
-        `❤️ <b>Likes:</b> ${track.favorite_count}\n` +
-        `🔁 <b>Reposts:</b> ${track.repost_count}`;
+        // 1. Send Alert Card to BOTH Notifier Bots
+        const secondaryNotificationCard =
+          `🎵 <b>New Feed Track Detected!</b>\n\n` +
+          `<b>Song Title:</b> <a href="${trackUrl}">${safeTitle}</a>\n` +
+          `<b>Artist:</b> <code>${safeArtist}</code>\n\n` +
+          `📊 <b>Initial Stats:</b>\n` +
+          `❤️ <b>Likes:</b> ${track.favorite_count}\n` +
+          `🔁 <b>Reposts:</b> ${track.repost_count}`;
 
-      await sendAllNotifiersAlert(secondaryNotificationCard);
+        await sendAllNotifiersAlert(secondaryNotificationCard);
 
-      // 2. If main bot execution is paused via /stop_bot, mark track as seen and skip actions
-      if (!isBotActive) {
+        // 2. If main bot execution is paused via /stop_bot, mark track as seen and skip actions
+        if (!isBotActive) {
+          processedSet.add(permalink);
+          saveCache(processedSet);
+          log.info(`⏸️ Main bot paused. Notifiers sent alerts for "${artistAndTitle}", actions skipped.`);
+          continue;
+        }
+
+        // 3. Threshold Check
+        if (track.favorite_count >= CONFIG.MAX_LIKES_THRESHOLD || track.repost_count >= CONFIG.MAX_REPOSTS_THRESHOLD) {
+          log.warn(`Threshold reached on "${artistAndTitle}". Skipping.`);
+          processedSet.add(permalink);
+          saveCache(processedSet);
+          continue;
+        }
+
+        // 4. Countdown & Action Execution on Primary Bot
+        const delaySeconds = getRandomDelaySec(CONFIG.MIN_ACTION_DELAY_SEC, CONFIG.MAX_ACTION_DELAY_SEC);
+        log.info(`⏳ New track found: "${artistAndTitle}". Starting ${delaySeconds}s countdown…`);
+
+        const { msgId: countdownMsgId, wasSkipped } = await runLiveCountdownInTelegram(artistAndTitle, trackUrl, delaySeconds, track.id);
+
+        if (wasSkipped) {
+          pendingSkips.delete(String(track.id));
+          processedSet.add(permalink);
+          saveCache(processedSet);
+
+          const skippedCard = 
+            `⏭️ <b>Track Skipped (Bot 2)</b>\n\n` +
+            `<b>Track:</b> <a href="${trackUrl}">${escapeHtml(artistAndTitle)}</a>\n` +
+            `<b>Status:</b> Skipped by user command. No actions taken.`;
+
+          if (countdownMsgId) {
+            await editTelegramMessage(countdownMsgId, skippedCard, []);
+          }
+          log.ok(`Skipped track execution for "${artistAndTitle}"`);
+          continue;
+        }
+
+        // Action probabilities (80% Like Roll, 100% Repost Roll)
+        const shouldLike = actionToggles.likeEnabled && Math.random() < CONFIG.LIKE_PROBABILITY;
+        const shouldRepost = actionToggles.repostEnabled && Math.random() < CONFIG.REPOST_PROBABILITY;
+
+        log.info(`⚡ Executing actions on: "${artistAndTitle}" (Like Roll: ${shouldLike}, Repost Roll: ${shouldRepost})`);
+
+        const [liked, reposted] = await Promise.all([
+          shouldLike ? apiLikeTrack(track.id) : Promise.resolve(false),
+          shouldRepost ? apiRepostTrack(track.id) : Promise.resolve(false)
+        ]);
+
         processedSet.add(permalink);
         saveCache(processedSet);
-        log.info(`⏸️ Main bot paused. Notifiers sent alerts for "${artistAndTitle}", actions skipped.`);
-        continue;
-      }
 
-      // 3. Threshold Check
-      if (track.favorite_count >= CONFIG.MAX_LIKES_THRESHOLD || track.repost_count >= CONFIG.MAX_REPOSTS_THRESHOLD) {
-        log.warn(`Threshold reached on "${artistAndTitle}". Skipping.`);
-        processedSet.add(permalink);
-        saveCache(processedSet);
-        continue;
-      }
+        // Persistent Undo Inline Keyboard Button
+        const undoButtonKeyboard = [
+          [{ text: '↩️ Undo (Unlike & Unrepost)', callback_data: `undo:${track.id}` }]
+        ];
 
-      // 4. Countdown & Action Execution on Primary Bot
-      const delaySeconds = getRandomDelaySec(CONFIG.MIN_ACTION_DELAY_SEC, CONFIG.MAX_ACTION_DELAY_SEC);
-      log.info(`⏳ New track found: "${artistAndTitle}". Starting ${delaySeconds}s countdown…`);
-
-      const { msgId: countdownMsgId, wasSkipped } = await runLiveCountdownInTelegram(artistAndTitle, trackUrl, delaySeconds, track.id);
-
-      if (wasSkipped) {
-        pendingSkips.delete(String(track.id));
-        processedSet.add(permalink);
-        saveCache(processedSet);
-
-        const skippedCard = 
-          `⏭️ <b>Track Skipped (Bot 2)</b>\n\n` +
+        const completedCard =
+          `🎵 <b>Track Successfully Processed! (Bot 2)</b>\n\n` +
           `<b>Track:</b> <a href="${trackUrl}">${escapeHtml(artistAndTitle)}</a>\n` +
-          `<b>Status:</b> Skipped by user command. No actions taken.`;
+          `<b>Stats:</b> ❤️ ${track.favorite_count} Likes | 🔁 ${track.repost_count} Reposts\n` +
+          `<b>Waited:</b> ${delaySeconds}s\n\n` +
+          `<b>Actions Taken:</b>\n` +
+          `• Liked (80% Roll): ${shouldLike ? (liked ? '✅' : '⚠️') : '⏭️ (Rolled Off)'}\n` +
+          `• Reposted (100% Roll): ${shouldRepost ? (reposted ? '✅' : '⚠️') : '⏭️'}`;
 
         if (countdownMsgId) {
-          await editTelegramMessage(countdownMsgId, skippedCard, []);
+          await editTelegramMessage(countdownMsgId, completedCard, undoButtonKeyboard);
+        } else {
+          await sendTelegramAlert(completedCard, false, undoButtonKeyboard);
         }
-        log.ok(`Skipped track execution for "${artistAndTitle}"`);
-        continue;
+
+        log.ok(`Successfully processed "${artistAndTitle}"`);
       }
-
-      log.info(`⚡ Executing actions on: "${artistAndTitle}"`);
-
-      // Execute Like & Repost Actions directly
-      const [liked, reposted] = await Promise.all([
-        actionToggles.likeEnabled ? apiLikeTrack(track.id) : Promise.resolve(false),
-        actionToggles.repostEnabled ? apiRepostTrack(track.id) : Promise.resolve(false)
-      ]);
-
-      processedSet.add(permalink);
-      saveCache(processedSet);
-
-      // Persistent Undo Inline Keyboard Button
-      const undoButtonKeyboard = [
-        [{ text: '↩️ Undo (Unlike & Unrepost)', callback_data: `undo:${track.id}` }]
-      ];
-
-      const completedCard =
-        `🎵 <b>Track Successfully Processed! (Bot 2)</b>\n\n` +
-        `<b>Track:</b> <a href="${trackUrl}">${escapeHtml(artistAndTitle)}</a>\n` +
-        `<b>Stats:</b> ❤️ ${track.favorite_count} Likes | 🔁 ${track.repost_count} Reposts\n` +
-        `<b>Waited:</b> ${delaySeconds}s\n\n` +
-        `<b>Actions Taken:</b>\n` +
-        `• Liked: ${actionToggles.likeEnabled ? (liked ? '✅' : '⚠️') : '⏭️'}\n` +
-        `• Reposted: ${actionToggles.repostEnabled ? (reposted ? '✅' : '⚠️') : '⏭️'}`;
-
-      if (countdownMsgId) {
-        await editTelegramMessage(countdownMsgId, completedCard, undoButtonKeyboard);
-      } else {
-        await sendTelegramAlert(completedCard, false, undoButtonKeyboard);
-      }
-
-      log.ok(`Successfully processed "${artistAndTitle}"`);
+    } catch (err) {
+      log.error(`Main Loop Error: ${err.message}`);
     }
 
     await sleep(CONFIG.REFRESH_INTERVAL_MS);
