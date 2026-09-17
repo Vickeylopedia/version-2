@@ -1,2 +1,8 @@
 node_modules/
+.env
+*.env
 cache.json
+cache_*.json
+puppeteer_session/
+.DS_Store
+npm-debug.log*

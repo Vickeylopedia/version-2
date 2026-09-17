@@ -1,21 +1,18 @@
 FROM node:20-slim
 
-# Install Chromium and required OS dependencies
-RUN apt-get update && apt-get install -y \
-    chromium \
-    fonts-ipafont-gothic fonts-wqy-zenhei fonts-thai-tlwg fonts-kacst fonts-freefont-ttf libxss1 \
-    --no-install-recommends \
-    && rm -rf /var/lib/apt-get/lists/*
-
-# Point Puppeteer to the system-installed Chromium binary
-ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
-    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
-
 WORKDIR /usr/src/app
 
-COPY package*.json ./
-RUN npm install
+ENV NODE_ENV=production
 
+# Install production dependencies
+COPY package*.json ./
+RUN npm install --omit=dev
+
+# Copy application source code
 COPY . .
 
-CMD ["node", "bot.mjs"]
+# Render defaults to port 10000
+EXPOSE 10000
+
+# Run with V8 memory optimizations and exposed garbage collection for Render RAM protection
+CMD ["node", "--optimize_for_size", "--max-old-space-size=350", "--expose-gc", "bot.mjs"]

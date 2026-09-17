@@ -1,3 +1,9 @@
 node_modules
 npm-debug.log
 .git
+.gitignore
+.env
+*.env
+cache*.json
+puppeteer_session
+README.md
